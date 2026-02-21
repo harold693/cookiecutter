@@ -324,6 +324,135 @@ def _run_hook_from_repo_dir(
     )
 
 
+def _partition_dirs(root: str, dirs: list[str], context: dict) -> tuple[list[str], list[str]]:
+    """Clasifica directorios en copy-only y render."""
+    copy_dirs = []
+    render_dirs = []
+    for d in sorted(dirs):
+        d_ = os.path.normpath(os.path.join(root, d))
+        if is_copy_only_path(d_, context):
+            logger.debug('Found copy only path %s', d)
+            copy_dirs.append(d)
+        else:
+            render_dirs.append(d)
+    return copy_dirs, render_dirs
+
+
+def _copy_directory(root: str, copy_dir: str, project_dir: str, env, context: dict) -> None:
+    """Copia un directorio sin renderizar."""
+    indir = os.path.normpath(os.path.join(root, copy_dir))
+    outdir = os.path.normpath(os.path.join(project_dir, indir))
+    outdir = env.from_string(outdir).render(**context)
+    logger.debug('Copying dir %s to %s without rendering', indir, outdir)
+    if os.path.isdir(outdir):
+        shutil.rmtree(outdir)
+    shutil.copytree(indir, outdir)
+
+
+def _process_copy_dirs(
+    root: str, copy_dirs: list[str], project_dir: str, env, context: dict
+) -> None:
+    """Procesa todos los directorios copy-only en el nivel actual."""
+    for copy_dir in copy_dirs:
+        _copy_directory(root, copy_dir, project_dir, env, context)
+
+
+def _create_dir_or_raise(
+    unrendered_dir: str,
+    context: dict,
+    output_dir: Path | str,
+    env,
+    overwrite_if_exists: bool,
+    project_dir: str,
+    delete_project_on_failure: bool,
+) -> None:
+    """Crea directorio renderizado o lanza UndefinedVariableInTemplate."""
+    try:
+        render_and_create_dir(
+            unrendered_dir, context, output_dir, env, overwrite_if_exists
+        )
+    except UndefinedError as err:
+        if delete_project_on_failure:
+            rmtree(project_dir)
+        _dir = os.path.relpath(unrendered_dir, output_dir)
+        msg = f"Unable to create directory '{_dir}'"
+        raise UndefinedVariableInTemplate(msg, err, context) from err
+
+
+def _generate_file_or_raise(
+    project_dir: str,
+    infile: str,
+    context: dict,
+    env,
+    skip_if_file_exists: bool,
+    delete_project_on_failure: bool,
+) -> None:
+    """Genera un archivo o lanza UndefinedVariableInTemplate."""
+    try:
+        generate_file(project_dir, infile, context, env, skip_if_file_exists)
+    except UndefinedError as err:
+        if delete_project_on_failure:
+            rmtree(project_dir)
+        msg = f"Unable to create file '{infile}'"
+        raise UndefinedVariableInTemplate(msg, err, context) from err
+
+
+def _process_files_in_root(
+    root: str,
+    files: list[str],
+    project_dir: str,
+    context: dict,
+    env,
+    skip_if_file_exists: bool,
+    delete_project_on_failure: bool,
+) -> None:
+    """Procesa todos los archivos en un nivel del walk."""
+    for f in sorted(files):
+        infile = os.path.normpath(os.path.join(root, f))
+        if is_copy_only_path(infile, context):
+            outfile_tmpl = env.from_string(infile)
+            outfile_rendered = outfile_tmpl.render(**context)
+            outfile = os.path.join(project_dir, outfile_rendered)
+            logger.debug('Copying file %s to %s without rendering', infile, outfile)
+            shutil.copyfile(infile, outfile)
+            shutil.copymode(infile, outfile)
+            continue
+        _generate_file_or_raise(
+            project_dir, infile, context, env,
+            skip_if_file_exists, delete_project_on_failure
+        )
+
+
+def _process_one_walk_level(
+    root: str,
+    dirs: list[str],
+    files: list[str],
+    project_dir: str,
+    output_dir: Path | str,
+    context: dict,
+    env,
+    overwrite_if_exists: bool,
+    skip_if_file_exists: bool,
+    delete_project_on_failure: bool,
+) -> None:
+    """Procesa un nivel de os.walk: clasifica dirs, copia, renderiza dirs y archivos."""
+    copy_dirs, render_dirs = _partition_dirs(root, dirs, context)
+    _process_copy_dirs(root, copy_dirs, project_dir, env, context)
+    dirs[:] = render_dirs
+
+    for d in dirs:
+        unrendered_dir = os.path.join(project_dir, root, d)
+        _create_dir_or_raise(
+            unrendered_dir, context, output_dir, env,
+            overwrite_if_exists, project_dir, delete_project_on_failure
+        )
+
+    _process_files_in_root(
+        root, files, project_dir, context, env,
+        skip_if_file_exists, delete_project_on_failure
+    )
+
+
 def generate_files(
     repo_dir: Path | str,
     context: dict[str, Any] | None = None,
@@ -334,7 +463,6 @@ def generate_files(
     keep_project_on_failure: bool = False,
 ) -> str:
     """Render the templates and saves them to files.
-
     :param repo_dir: Project template input directory.
     :param context: Dict for populating the template's variables.
     :param output_dir: Where to output the generated project dir into.
@@ -347,15 +475,12 @@ def generate_files(
         generation fails
     """
     context = context or OrderedDict([])
-
     env = create_env_with_context(context)
-
     template_dir = find_template(repo_dir, env)
     logger.debug('Generating project from %s...', template_dir)
-
     unrendered_dir = os.path.split(template_dir)[1]
+
     try:
-        project_dir: Path | str
         project_dir, output_directory_created = render_and_create_dir(
             unrendered_dir, context, output_dir, env, overwrite_if_exists
         )
@@ -363,18 +488,8 @@ def generate_files(
         msg = f"Unable to create project directory '{unrendered_dir}'"
         raise UndefinedVariableInTemplate(msg, err, context) from err
 
-    # We want the Jinja path and the OS paths to match. Consequently, we'll:
-    #   + CD to the template folder
-    #   + Set Jinja's path to '.'
-    #
-    #  In order to build our files to the correct folder(s), we'll use an
-    # absolute path for the target folder (project_dir)
-
     project_dir = os.path.abspath(project_dir)
     logger.debug('Project directory is %s', project_dir)
-
-    # if we created the output directory, then it's ok to remove it
-    # if rendering fails
     delete_project_on_failure = output_directory_created and not keep_project_on_failure
 
     if accept_hooks:
@@ -384,75 +499,11 @@ def generate_files(
 
     with work_in(template_dir):
         env.loader = FileSystemLoader(['.', '../templates'])
-
         for root, dirs, files in os.walk('.'):
-            # We must separate the two types of dirs into different lists.
-            # The reason is that we don't want ``os.walk`` to go through the
-            # unrendered directories, since they will just be copied.
-            copy_dirs = []
-            render_dirs = []
-
-            for d in sorted(dirs):
-                d_ = os.path.normpath(os.path.join(root, d))
-                # We check the full path, because that's how it can be
-                # specified in the ``_copy_without_render`` setting, but
-                # we store just the dir name
-                if is_copy_only_path(d_, context):
-                    logger.debug('Found copy only path %s', d)
-                    copy_dirs.append(d)
-                else:
-                    render_dirs.append(d)
-
-            for copy_dir in copy_dirs:
-                indir = os.path.normpath(os.path.join(root, copy_dir))
-                outdir = os.path.normpath(os.path.join(project_dir, indir))
-                outdir = env.from_string(outdir).render(**context)
-                logger.debug('Copying dir %s to %s without rendering', indir, outdir)
-
-                # The outdir is not the root dir, it is the dir which marked as copy
-                # only in the config file. If the program hits this line, which means
-                # the overwrite_if_exists = True, and root dir exists
-                if os.path.isdir(outdir):
-                    shutil.rmtree(outdir)
-                shutil.copytree(indir, outdir)
-
-            # We mutate ``dirs``, because we only want to go through these dirs
-            # recursively
-            dirs[:] = render_dirs
-            for d in dirs:
-                unrendered_dir = os.path.join(project_dir, root, d)
-                try:
-                    render_and_create_dir(
-                        unrendered_dir, context, output_dir, env, overwrite_if_exists
-                    )
-                except UndefinedError as err:
-                    if delete_project_on_failure:
-                        rmtree(project_dir)
-                    _dir = os.path.relpath(unrendered_dir, output_dir)
-                    msg = f"Unable to create directory '{_dir}'"
-                    raise UndefinedVariableInTemplate(msg, err, context) from err
-
-            for f in sorted(files):
-                infile = os.path.normpath(os.path.join(root, f))
-                if is_copy_only_path(infile, context):
-                    outfile_tmpl = env.from_string(infile)
-                    outfile_rendered = outfile_tmpl.render(**context)
-                    outfile = os.path.join(project_dir, outfile_rendered)
-                    logger.debug(
-                        'Copying file %s to %s without rendering', infile, outfile
-                    )
-                    shutil.copyfile(infile, outfile)
-                    shutil.copymode(infile, outfile)
-                    continue
-                try:
-                    generate_file(
-                        project_dir, infile, context, env, skip_if_file_exists
-                    )
-                except UndefinedError as err:
-                    if delete_project_on_failure:
-                        rmtree(project_dir)
-                    msg = f"Unable to create file '{infile}'"
-                    raise UndefinedVariableInTemplate(msg, err, context) from err
+            _process_one_walk_level(
+                root, dirs, files, project_dir, output_dir, context, env,
+                overwrite_if_exists, skip_if_file_exists, delete_project_on_failure
+            )
 
     if accept_hooks:
         run_hook_from_repo_dir(
@@ -462,5 +513,4 @@ def generate_files(
             context,
             delete_project_on_failure,
         )
-
     return project_dir
